@@ -715,7 +715,6 @@ class EnVariationalDiffusion(nn.Module):
 
         return list(reversed(repaint_schedule))
 
-    @torch.no_grad()
     def inpaint(self, ligand, pocket, lig_fixed, pocket_fixed, resamplings=1,
                 jump_length=1, return_frames=1, timesteps=None):
         """
@@ -782,10 +781,27 @@ class EnVariationalDiffusion(nn.Module):
 
                 # CODE STARTS HERE
 
+                z_pocket.requires_grad_(True)
+                
                 S = 1 # Hardcoded guidance strength
+                clamp_min = -0.25 # Hardcoded gradient clamp min
+                clamp_max = 0.25 # Hardcoded gradient clamp max
                 ligand_mask = ligand['mask']
                 pocket_mask = pocket['mask']
+                gamma_t = self.gamma(t_array)
+                gamma_s = self.gamma(s_array)
+                gamma_t_pocket = self.inflate_batch_array(gamma_t, pocket['x'])
 
+                # get w_t but current notation does not fit Uniguide paper notation so further computation is required to get beta_t / sqrt(alpha_t)
+                # code heavy due to current function implementation, refactoring coulde help here but requires changing original codebase
+
+                empty_tensor = torch.tensor([], device=z_lig.device)
+
+                denominator = self.alpha(gamma_t, empty_tensor)[0] / self.alpha(gamma_s, empty_tensor)[0] # sqrt(alpha_t) in uniguide paper
+                numerator = 1 - torch.pow(denominator, 2) # beta_t in uniguide paper
+
+                w_t = numerator / denominator
+                   
                 # get mu, sigma and epsilon
 
                 mu_lig, mu_pocket, sigma, eps_t_lig, eps_t_pocket = self.get_mu_sigma_epsilon(
@@ -793,40 +809,44 @@ class EnVariationalDiffusion(nn.Module):
 
                 # get clean datapoint
 
-                z_clean_lig = self.xh_given_zt_and_epsilon(z_lig, eps_t_lig, gamma_t, ligand_mask)
-                z_clean_pocket = self.xh_given_zt_and_epsilon(z_pocket, eps_t_pocket, gamma_t, pocket_mask)
+                z_clean_pocket = self.xh_given_zt_and_epsilon(z_pocket, eps_t_pocket, gamma_t_pocket, pocket_mask)
 
                 # get z_tilde
 
-                z_tilde = torch.cat((xh0_lig, xh0_pocket))
+                z_tilde = xh0_pocket*pocket_fixed
 
                 # get z_clean
 
-                z_clean = torch.cat((z_clean_lig, z_clean_pocket))
+                z_clean = z_clean_pocket*pocket_fixed 
 
                 # compute loss
 
-                loss = self.guidance_loss(z_tilde, z_clean)
+                loss = self.inpainting_loss(z_tilde, z_clean)
 
                 # compute gradients
 
-                gradients_lig, gradients_pocket = torch.autograd.grad(outputs=loss, inputs=[z_clean_lig, z_clean_pocket], retain_graph=True)
+                gradients_pocket = torch.autograd.grad(outputs=loss, inputs=z_pocket, retain_graph=False)[0]
 
                 # compute g
 
-                g_lig_x = self.remove_mean_batch(gradients_lig[:, :self.n_dims], ligand_mask)
-                g_lig = torch.cat((g_lig_x[:len(ligand_mask)],
-                                    gradients_lig[:, self.n_dims:]), dim=1)
-                
-                g_pocket_x = self.remove_mean_batch(gradients_pocket[:, :self.n_dims], pocket_mask)
+                com_gradients_pocket_x = scatter_mean(
+                    gradients_pocket[:, :self.n_dims][pocket_fixed.bool().view(-1)],
+                    pocket_mask[pocket_fixed.bool().view(-1)],
+                    dim=0
+                )
+
+                g_pocket_x = gradients_pocket[:, :self.n_dims] - com_gradients_pocket_x[pocket_mask]
                 g_pocket = torch.cat((g_pocket_x[:len(pocket_mask)],
                                     gradients_pocket[:, self.n_dims:]), dim=1)
                 
+                # update vec with clamp for numerical stability
+
+                update_vec = torch.clamp(w_t*S*g_pocket*pocket_fixed, min=clamp_min, max=clamp_max)
+                
                 # update mu fixed with guidance
 
-                mu_pocket = mu_pocket - S*g_pocket*pocket_fixed
-                mu_lig = mu_lig - S*g_lig*lig_fixed
-
+                mu_pocket = mu_pocket - update_vec
+                
                 # Sample zs given the parameters derived from zt.
                 zs_lig, zs_pocket = self.sample_normal(mu_lig, mu_pocket, sigma,
                                                     ligand_mask, pocket_mask)
@@ -843,60 +863,63 @@ class EnVariationalDiffusion(nn.Module):
                 z_pocket = torch.cat((zs_x[len(ligand_mask):],
                                     zs_pocket[:, self.n_dims:]), dim=1)
                 
+                # DEBUG DATA
+
+                file_paths = [
+                    "/mu_pocket.txt",
+                    "/g_pocket.txt",
+                    "/gradients_pocket.txt",
+                    "/z_pocket.txt",
+                    "/w_t.txt",
+                    "/loss.txt",
+                    "/z_tilde.txt",
+                    "/z_clean.txt",
+                    "/eps_t_pocket.txt",
+                    "/alpha_t.txt",
+                    "/sigma_t.txt",
+                    "/t.txt",
+                    "/pocket_mask.txt",
+                    "/pocket_fixed.txt",
+                    "/pocket_mask_shape.txt",
+                    "/pocket_fixed_shape.txt",
+                    "/loss_grad.txt",
+                    "/update_vec.txt"
+                ]
+
+                # Data to be written
+                data_to_write = [
+                    mu_pocket,
+                    g_pocket,
+                    gradients_pocket,
+                    z_pocket,
+                    w_t,
+                    loss,
+                    z_tilde,
+                    z_clean,
+                    eps_t_pocket,
+                    self.alpha(gamma_t, z_pocket),
+                    self.sigma(gamma_t, z_pocket),
+                    t_array,
+                    pocket_mask,
+                    pocket_fixed,
+                    pocket_mask.shape,
+                    pocket_fixed.shape,
+                    loss.grad_fn,
+                    update_vec
+                ]
+
+                # Append each tensor to a separate file
+                for path, data in zip(file_paths, data_to_write):
+                    with open(path, 'a') as file:  # Changed 'w' to 'a' to append instead of rewrite
+                        file.write(str(data) + '\n')  # Optionally, add a newline for better readability
+
+                
                 self.assert_mean_zero_with_mask(
                     torch.cat((z_lig[:, :self.n_dims],
                                z_pocket[:, :self.n_dims]), dim=0), combined_mask
                 )
 
                 # CODE FINISHES HERE
-                
-
-                """
-                # sample known nodes from the input
-                gamma_s = self.inflate_batch_array(self.gamma(s_array),
-                                                   ligand['x'])
-                z_lig_known, z_pocket_known, _, _ = self.noised_representation(
-                    xh0_lig, xh0_pocket, ligand['mask'], pocket['mask'], gamma_s)
-
-                # sample inpainted part
-                z_lig_unknown, z_pocket_unknown = self.sample_p_zs_given_zt(
-                    s_array, t_array, z_lig, z_pocket, ligand['mask'],
-                    pocket['mask'])
-
-                # move center of mass of the noised part to the center of mass
-                # of the corresponding denoised part before combining them
-                # -> the resulting system should be COM-free
-                com_noised = scatter_mean(
-                    torch.cat((z_lig_known[:, :self.n_dims][lig_fixed.bool().view(-1)],
-                               z_pocket_known[:, :self.n_dims][pocket_fixed.bool().view(-1)])),
-                    torch.cat((ligand['mask'][lig_fixed.bool().view(-1)],
-                               pocket['mask'][pocket_fixed.bool().view(-1)])),
-                    dim=0
-                )
-                com_denoised = scatter_mean(
-                    torch.cat((z_lig_unknown[:, :self.n_dims][lig_fixed.bool().view(-1)],
-                               z_pocket_unknown[:, :self.n_dims][pocket_fixed.bool().view(-1)])),
-                    torch.cat((ligand['mask'][lig_fixed.bool().view(-1)],
-                               pocket['mask'][pocket_fixed.bool().view(-1)])),
-                    dim=0
-                )
-                z_lig_known[:, :self.n_dims] = \
-                    z_lig_known[:, :self.n_dims] + (com_denoised - com_noised)[ligand['mask']]
-                z_pocket_known[:, :self.n_dims] = \
-                    z_pocket_known[:, :self.n_dims] + (com_denoised - com_noised)[pocket['mask']]
-
-                # combine
-                z_lig = z_lig_known * lig_fixed + \
-                        z_lig_unknown * (1 - lig_fixed)
-                z_pocket = z_pocket_known * pocket_fixed + \
-                           z_pocket_unknown * (1 - pocket_fixed)
-
-                self.assert_mean_zero_with_mask(
-                    torch.cat((z_lig[:, :self.n_dims],
-                               z_pocket[:, :self.n_dims]), dim=0), combined_mask
-                )
-
-                """
 
                 # save frame at the end of a resample cycle
                 if n_denoise_steps > jump_length or i == len(schedule) - 1:
@@ -969,54 +992,68 @@ class EnVariationalDiffusion(nn.Module):
                (p_sigma ** 2) - 0.5 * d
 
     @staticmethod
-    def kabsch_batched(P, Q):
+    def kabsch(P, Q):
         """
-        Original code from https://hunterheidenreich.com/posts/kabsch_algorithm/
+        Code from https://hunterheidenreich.com/posts/kabsch_algorithm/
 
-        Computes the optimal rotation and translation to align two sets of points (P -> Q),
-        and their RMSD, in a batched manner.
-        :param P: A BxNx3 matrix of points
-        :param Q: A BxNx3 matrix of points
-        :return: A tuple containing the optimal rotation matrix, the optimal
-                translation vector, and the RMSD.
+        Computes the optimal rotation and translation to align two sets of points (P -> Q)
+        :param P: A Nx3 matrix of points
+        :param Q: A Nx3 matrix of points
+        :return: A tuple containing the optimal rotation matrix and the optimal
+                translation vector.
         """
+        assert P.shape == Q.shape, "Matrix dimensions must match"
 
         # Compute centroids
-        centroid_P = torch.mean(P, dim=1, keepdims=True)  # Bx1x3
-        centroid_Q = torch.mean(Q, dim=1, keepdims=True)  #
+        centroid_P = torch.mean(P, dim=0)
+        centroid_Q = torch.mean(Q, dim=0)
 
         # Optimal translation
-        t = centroid_Q - centroid_P  # Bx1x3
-        t = t.squeeze(1)  # Bx3
+        t = centroid_Q - centroid_P
 
         # Center the points
-        p = P - centroid_P  # BxNx3
-        q = Q - centroid_Q  # BxNx3
+        p = P - centroid_P
+        q = Q - centroid_Q
 
         # Compute the covariance matrix
-        H = torch.matmul(p.transpose(1, 2), q)  # Bx3x3
+        H = torch.matmul(p.transpose(0, 1), q)
 
         # SVD
-        U, S, Vt = torch.linalg.svd(H)  # Bx3x3
+        U, S, Vt = torch.linalg.svd(H)
 
         # Validate right-handed coordinate system
-        d = torch.det(torch.matmul(Vt.transpose(1, 2), U.transpose(1, 2)))  # B
-        flip = d < 0.0
-        if flip.any().item():
-            Vt[flip, -1] *= -1.0
+        d = torch.sign(torch.det(torch.matmul(Vt.transpose(0, 1), U.transpose(0, 1))))
+        
+        M = torch.diag(torch.tensor([1,1,d], dtype=P.dtype, device=P.device))
 
         # Optimal rotation
-        R = torch.matmul(Vt.transpose(1, 2), U.transpose(1, 2))
+        R = torch.matmul(Vt.transpose(0, 1), torch.matmul(M, U.transpose(0, 1)))
 
         return R, t
 
-    def guidance_loss(self, z_til, z_t_known):
+    def guidance_loss(self, z_tilde, z_clean):
         """
         Computes the guidance loss as described in the 
         "Unified Guidance for Geometry-Conditioned Molecular Generation" paper when S=Z
         """
-        R, t = self.kabsch_batched(z_til, z_t_known)
-        return 1/2 * torch.square(torch.norm(z_t_known, torch.matmul(R, z_til + t)))
+        x_tilde = z_tilde[:, :self.n_dims]
+        x_clean = z_clean[:, :self.n_dims]
+
+        R, _ = self.kabsch(x_tilde, x_clean) # both are centered at [0,0,0] so no translation is needed
+        x_tilde_rotated = torch.matmul(x_tilde, R.transpose(0,1))
+        z_tilde_rotated = torch.cat((x_tilde_rotated, z_tilde[:, self.n_dims:]), dim=1)
+
+        return 1/2 * torch.square(torch.norm(z_clean - z_tilde_rotated))
+
+
+    def inpainting_loss(self, z_tilde, z_clean):
+        """
+        Computes an inpainting loss, similar to the loss described in the
+        "Unified Guidance for Geometry-Conditioned Molecular Generation" paper 
+        """
+        return 1/2 * torch.square(torch.norm(z_clean - z_tilde))
+
+
 
     @staticmethod
     def inflate_batch_array(array, target):
