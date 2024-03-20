@@ -784,16 +784,15 @@ class EnVariationalDiffusion(nn.Module):
                 z_pocket.requires_grad_(True)
                 
                 S = 1 # Hardcoded guidance strength
-                clamp_min = -0.25 # Hardcoded gradient clamp min
-                clamp_max = 0.25 # Hardcoded gradient clamp max
+                clamp_min = -2 # Hardcoded gradient clamp min
+                clamp_max =  2 # Hardcoded gradient clamp max
                 ligand_mask = ligand['mask']
                 pocket_mask = pocket['mask']
                 gamma_t = self.gamma(t_array)
                 gamma_s = self.gamma(s_array)
-                gamma_t_pocket = self.inflate_batch_array(gamma_t, pocket['x'])
 
                 # get w_t but current notation does not fit Uniguide paper notation so further computation is required to get beta_t / sqrt(alpha_t)
-                # code heavy due to current function implementation, refactoring coulde help here but requires changing original codebase
+                # code heavy due to current function implementation, refactoring could help here but requires changing original codebase
 
                 empty_tensor = torch.tensor([], device=z_lig.device)
 
@@ -809,7 +808,7 @@ class EnVariationalDiffusion(nn.Module):
 
                 # get clean datapoint
 
-                z_clean_pocket = self.xh_given_zt_and_epsilon(z_pocket, eps_t_pocket, gamma_t_pocket, pocket_mask)
+                z_clean_pocket = self.compute_x_pred(eps_t_pocket, z_pocket, gamma_t, pocket_mask)
 
                 # get z_tilde
 
@@ -821,7 +820,7 @@ class EnVariationalDiffusion(nn.Module):
 
                 # compute loss
 
-                loss = self.inpainting_loss(z_tilde, z_clean)
+                loss = self.guidance_loss(z_tilde, z_clean)
 
                 # compute gradients
 
@@ -842,7 +841,7 @@ class EnVariationalDiffusion(nn.Module):
                 # update vec with clamp for numerical stability
 
                 update_vec = torch.clamp(w_t*S*g_pocket*pocket_fixed, min=clamp_min, max=clamp_max)
-                
+
                 # update mu fixed with guidance
 
                 mu_pocket = mu_pocket - update_vec
@@ -862,57 +861,6 @@ class EnVariationalDiffusion(nn.Module):
                                     zs_lig[:, self.n_dims:]), dim=1)
                 z_pocket = torch.cat((zs_x[len(ligand_mask):],
                                     zs_pocket[:, self.n_dims:]), dim=1)
-                
-                # DEBUG DATA
-
-                file_paths = [
-                    "/mu_pocket.txt",
-                    "/g_pocket.txt",
-                    "/gradients_pocket.txt",
-                    "/z_pocket.txt",
-                    "/w_t.txt",
-                    "/loss.txt",
-                    "/z_tilde.txt",
-                    "/z_clean.txt",
-                    "/eps_t_pocket.txt",
-                    "/alpha_t.txt",
-                    "/sigma_t.txt",
-                    "/t.txt",
-                    "/pocket_mask.txt",
-                    "/pocket_fixed.txt",
-                    "/pocket_mask_shape.txt",
-                    "/pocket_fixed_shape.txt",
-                    "/loss_grad.txt",
-                    "/update_vec.txt"
-                ]
-
-                # Data to be written
-                data_to_write = [
-                    mu_pocket,
-                    g_pocket,
-                    gradients_pocket,
-                    z_pocket,
-                    w_t,
-                    loss,
-                    z_tilde,
-                    z_clean,
-                    eps_t_pocket,
-                    self.alpha(gamma_t, z_pocket),
-                    self.sigma(gamma_t, z_pocket),
-                    t_array,
-                    pocket_mask,
-                    pocket_fixed,
-                    pocket_mask.shape,
-                    pocket_fixed.shape,
-                    loss.grad_fn,
-                    update_vec
-                ]
-
-                # Append each tensor to a separate file
-                for path, data in zip(file_paths, data_to_write):
-                    with open(path, 'a') as file:  # Changed 'w' to 'a' to append instead of rewrite
-                        file.write(str(data) + '\n')  # Optionally, add a newline for better readability
-
                 
                 self.assert_mean_zero_with_mask(
                     torch.cat((z_lig[:, :self.n_dims],
@@ -1043,7 +991,7 @@ class EnVariationalDiffusion(nn.Module):
         x_tilde_rotated = torch.matmul(x_tilde, R.transpose(0,1))
         z_tilde_rotated = torch.cat((x_tilde_rotated, z_tilde[:, self.n_dims:]), dim=1)
 
-        return 1/2 * torch.square(torch.norm(z_clean - z_tilde_rotated))
+        return 1/(2*torch.numel(z_clean)) * torch.sum(torch.square(z_clean - z_tilde_rotated))
 
 
     def inpainting_loss(self, z_tilde, z_clean):
@@ -1051,8 +999,7 @@ class EnVariationalDiffusion(nn.Module):
         Computes an inpainting loss, similar to the loss described in the
         "Unified Guidance for Geometry-Conditioned Molecular Generation" paper 
         """
-        return 1/2 * torch.square(torch.norm(z_clean - z_tilde))
-
+        return 1/(2*torch.numel(z_clean)) * (torch.sum(torch.square(z_clean - z_tilde)))
 
 
     @staticmethod
